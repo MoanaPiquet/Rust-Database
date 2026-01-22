@@ -1,3 +1,6 @@
+use rust_database::DatabaseConfig;
+
 fn main() {
-    println!("Hello, world!");
+    let data = DatabaseConfig::new();
+    println!("{:?}", data);
 }
