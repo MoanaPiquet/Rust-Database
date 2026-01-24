@@ -1,41 +1,101 @@
-use rust_database::{DatabaseConfig, MyDatabase};
+use rust_database::{DatabaseConfig, DatabaseError, MyDatabase};
+use std::io::{self, Write};
 
-fn main() -> Result<(), std::io::Error> {
+fn main() -> Result<(), DatabaseError> {
     let config = DatabaseConfig::new();
-    println!("Démarrage avec la config : {:?}", config);
-
     let mut db = MyDatabase::new(config);
 
-    let key = b"nom".to_vec();
-    let value = b"rustacean".to_vec();
-    let _ = db.put(key.clone(), value.clone());
-    println!(
-        "✓ Donnée écrite : {:?} = {:?}",
-        String::from_utf8_lossy(&key),
-        String::from_utf8_lossy(&value)
-    );
+    println!("=== Rust Database CLI (REPL) ===");
+    println!("Commandes disponibles:");
+    println!("  SET <clé> <valeur>  - Ajoute/met à jour une clé");
+    println!("  GET <clé>           - Récupère une valeur");
+    println!("  DELETE <clé>        - Supprime une clé (Tombstone)");
+    println!("  EXIT                - Quitte le programme\n");
 
-    match db.get(&key)? {
-        Some(retrieved_value) => {
-            println!(
-                "✓ Donnée lue : {:?}",
-                String::from_utf8_lossy(&retrieved_value)
-            );
+    loop {
+        print!("rdb > ");
+        io::stdout().flush().map_err(DatabaseError::Io)?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(DatabaseError::Io)?;
+
+        let input = input.trim();
+
+        if input.is_empty() {
+            continue;
         }
-        None => {
-            println!("✗ Clé non trouvée");
+
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let command = parts[0].to_uppercase();
+
+        match command.as_str() {
+            "SET" => {
+                if parts.len() < 3 {
+                    println!("Usage: SET <clé> <valeur>");
+                    continue;
+                }
+
+                let key = parts[1].as_bytes().to_vec();
+                let value = parts[2..].join(" ").as_bytes().to_vec();
+
+                match db.set(key.clone(), value.clone()) {
+                    Ok(_) => println!(
+                        "SET '{}' = '{}'",
+                        String::from_utf8(key)?,
+                        String::from_utf8(value)?
+                    ),
+                    Err(e) => println!("Erreur SET: {}", e),
+                }
+            }
+
+            "GET" => {
+                if parts.len() < 2 {
+                    println!("Usage: GET <clé>");
+                    continue;
+                }
+
+                let key = parts[1].as_bytes().to_vec();
+
+                match db.get(&key) {
+                    Ok(Some(value)) => println!(
+                        "GET '{}' = '{}'",
+                        String::from_utf8(key.clone())?,
+                        String::from_utf8(value)?
+                    ),
+                    Ok(None) => println!("Clé '{}' non trouvée", String::from_utf8(key)?),
+                    Err(e) => println!("Erreur GET: {}", e),
+                }
+            }
+
+            "DELETE" => {
+                if parts.len() < 2 {
+                    println!("Usage: DELETE <clé>");
+                    continue;
+                }
+
+                let key = parts[1].as_bytes().to_vec();
+
+                match db.delete(key.clone()) {
+                    Ok(_) => println!("DELETE '{}' (Tombstone écrit)", String::from_utf8(key)?),
+                    Err(e) => println!("Erreur DELETE: {}", e),
+                }
+            }
+
+            "EXIT" | "QUIT" => {
+                println!("Fermeture de la base de données...");
+                break;
+            }
+
+            _ => {
+                println!("Commande inconnue. Commandes disponibles :");
+                println!("  SET <clé> <valeur> : Enregistrer une donnée");
+                println!("  GET <clé>          : Lire une donnée");
+                println!("  DELETE <clé>       : Supprimer une donnée");
+                println!("  EXIT               : Quitter le programme");
+            }
         }
-    }
-
-    db.put(b"age".to_vec(), b"25".to_vec())?;
-    db.put(b"langage".to_vec(), b"Rust".to_vec())?;
-
-    println!("\n=== Vérification des données ===");
-    if let Some(age) = db.get(b"age")? {
-        println!("age: {}", String::from_utf8_lossy(&age));
-    }
-    if let Some(lang) = db.get(b"langage")? {
-        println!("langage: {}", String::from_utf8_lossy(&lang));
     }
 
     Ok(())
