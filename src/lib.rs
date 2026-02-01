@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Configuration de la base de données
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub file_path: PathBuf,
     pub max_size: u64,
@@ -38,8 +39,8 @@ pub struct DataEntry {
 }
 
 impl DataEntry {
-    /// Sérialise l'entrée en format binaire :
-    /// [Type (1B)] [Taille Clé (4B)] [Taille Valeur (4B)] [Clé] [Valeur] [Checksum (4B)]
+    // Sérialise l'entrée en format binaire :
+    // [Type (1B)] [Taille Clé (4B)] [Taille Valeur (4B)] [Clé] [Valeur] [Checksum (4B)]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buffer = Vec::new();
 
@@ -81,14 +82,20 @@ pub fn append_entry(config: &DatabaseConfig, entry: &DataEntry) -> io::Result<()
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub struct IndexEntry {
     pub offset: u64,
     pub size: u32,
 }
 
+pub struct SharedState {
+    pub file: Mutex<File>,
+    pub index: RwLock<HashMap<Vec<u8>, IndexEntry>>,
+}
+
 pub struct MyDatabase {
     pub config: DatabaseConfig,
-    pub index: HashMap<Vec<u8>, IndexEntry>,
+    pub shared: Arc<SharedState>,
 }
 
 #[derive(Debug)]
@@ -99,6 +106,7 @@ pub enum DatabaseError {
     KeyNotFound(String),
     ParseError(String),
     Utf8(std::string::FromUtf8Error),
+    LockPoisoned(&'static str),
 }
 
 impl std::fmt::Display for DatabaseError {
@@ -112,6 +120,9 @@ impl std::fmt::Display for DatabaseError {
             DatabaseError::KeyNotFound(key) => write!(f, "Clé non trouvée : '{}'", key),
             DatabaseError::ParseError(msg) => write!(f, "Erreur de commande : {}", msg),
             DatabaseError::Utf8(err) => write!(f, "Données corrompues (UTF-8) : {}", err),
+            DatabaseError::LockPoisoned(resource) => {
+                write!(f, "Verrouillage indisponible : {}", resource)
+            }
         }
     }
 }
@@ -131,15 +142,22 @@ impl From<std::string::FromUtf8Error> for DatabaseError {
 impl std::error::Error for DatabaseError {}
 
 impl MyDatabase {
-    pub fn new(config: DatabaseConfig) -> Self {
-        Self {
-            config,
-            index: HashMap::new(),
-        }
+    pub fn new(config: DatabaseConfig) -> Result<Self, DatabaseError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&config.file_path)?;
+
+        let shared = Arc::new(SharedState {
+            file: Mutex::new(file),
+            index: RwLock::new(HashMap::new()),
+        });
+
+        Ok(Self { config, shared })
     }
 
-    /// SET : Ajoute une entrée à la fin du fichier (Append-only)
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), DatabaseError> {
+    pub fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), DatabaseError> {
         let entry = DataEntry {
             entry_type: EntryType::Data,
             key: key.clone(),
@@ -148,30 +166,50 @@ impl MyDatabase {
         let bytes = entry.to_bytes();
         let size = bytes.len() as u32;
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&self.config.file_path)?;
+        let offset = {
+            let mut file = self
+                .shared
+                .file
+                .lock()
+                .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
+            let offset = file.seek(SeekFrom::End(0))?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            offset
+        };
 
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&bytes)?;
-
-        self.index.insert(key, IndexEntry { offset, size });
+        let mut index = self
+            .shared
+            .index
+            .write()
+            .map_err(|_| DatabaseError::LockPoisoned("index"))?;
+        index.insert(key, IndexEntry { offset, size });
         Ok(())
     }
 
-    /// GET : Cherche dans l'index + lit l'offset
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
-        let index_info = match self.index.get(key) {
-            Some(e) => e,
-            None => return Ok(None),
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
+        let index_info = {
+            let index = self
+                .shared
+                .index
+                .read()
+                .map_err(|_| DatabaseError::LockPoisoned("index"))?;
+            match index.get(key) {
+                Some(entry) => *entry,
+                None => return Ok(None),
+            }
         };
 
-        let mut file = File::open(&self.config.file_path)?;
-        file.seek(SeekFrom::Start(index_info.offset))?;
-
         let mut buffer = vec![0; index_info.size as usize];
-        file.read_exact(&mut buffer)?;
+        {
+            let mut file = self
+                .shared
+                .file
+                .lock()
+                .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
+            file.seek(SeekFrom::Start(index_info.offset))?;
+            file.read_exact(&mut buffer)?;
+        }
 
         if buffer[0] == 1 {
             return Ok(None);
@@ -218,8 +256,7 @@ impl MyDatabase {
         Ok(Some(buffer[value_start..value_end].to_vec()))
     }
 
-    /// DELETE : Ajoute une Tombstone sur le disque + met à jour l'index
-    pub fn delete(&mut self, key: Vec<u8>) -> Result<(), DatabaseError> {
+    pub fn delete(&self, key: Vec<u8>) -> Result<(), DatabaseError> {
         let entry = DataEntry {
             entry_type: EntryType::Tombstone,
             key: key.clone(),
@@ -228,15 +265,73 @@ impl MyDatabase {
         let bytes = entry.to_bytes();
         let size = bytes.len() as u32;
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&self.config.file_path)?;
+        let offset = {
+            let mut file = self
+                .shared
+                .file
+                .lock()
+                .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
+            let offset = file.seek(SeekFrom::End(0))?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            offset
+        };
 
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&bytes)?;
-
-        self.index.insert(key, IndexEntry { offset, size });
+        let mut index = self
+            .shared
+            .index
+            .write()
+            .map_err(|_| DatabaseError::LockPoisoned("index"))?;
+        index.insert(key, IndexEntry { offset, size });
         Ok(())
+    }
+}
+
+impl Clone for MyDatabase {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::thread;
+
+    #[test]
+    fn concurrent_set_get() {
+        let db_path = PathBuf::from("test_concurrent.db");
+        let _ = fs::remove_file(&db_path);
+
+        let mut config = DatabaseConfig::new();
+        config.file_path = db_path.clone();
+        let db = MyDatabase::new(config).expect("créer la base concurrente");
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let db = db.clone();
+                thread::spawn(move || {
+                    let key = format!("key-{}", i).into_bytes();
+                    let value = format!("value-{}", i).into_bytes();
+                    db.set(key.clone(), value.clone()).expect("set concurrent");
+                    let read = db
+                        .get(&key)
+                        .expect("lecture concurrente")
+                        .expect("clé présente");
+                    assert_eq!(read, value);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("panic thread");
+        }
+
+        let _ = fs::remove_file(&db_path);
     }
 }

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 fn main() -> Result<(), DatabaseError> {
     let config = DatabaseConfig::new();
-    let mut db = MyDatabase::new(config);
+    let db = MyDatabase::new(config)?;
 
     println!("=== Rust Database CLI (REPL) ===");
     println!("Commandes disponibles:");
