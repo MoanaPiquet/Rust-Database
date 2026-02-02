@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -51,12 +51,13 @@ impl DataEntry {
         buffer.push(type_byte);
 
         let key_len = (self.key.len() as u32).to_be_bytes();
-        let val_len = (self.value.len() as u32).to_be_bytes();
+        let encoded_value = MyDatabase::lz77_encode(&self.value);
+        let val_len = (encoded_value.len() as u32).to_be_bytes();
 
         buffer.extend_from_slice(&key_len);
         buffer.extend_from_slice(&val_len);
         buffer.extend_from_slice(&self.key);
-        buffer.extend_from_slice(&self.value);
+        buffer.extend_from_slice(&encoded_value);
 
         // Somme de contrôle simple
         let mut checksum: u32 = 0;
@@ -168,30 +169,34 @@ impl MyDatabase {
         let bytes = entry.to_bytes();
         let size = bytes.len() as u32;
 
-        let _access_guard = self
-            .shared
-            .access
-            .write()
-            .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
-
-        let offset = {
-            let mut file = self
+        {
+            let _access_guard = self
                 .shared
-                .file
-                .lock()
-                .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
-            let offset = file.seek(SeekFrom::End(0))?;
-            file.write_all(&bytes)?;
-            file.flush()?;
-            offset
-        };
+                .access
+                .write()
+                .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
 
-        let mut index = self
-            .shared
-            .index
-            .write()
-            .map_err(|_| DatabaseError::LockPoisoned("index"))?;
-        index.insert(key, IndexEntry { offset, size });
+            let offset = {
+                let mut file = self
+                    .shared
+                    .file
+                    .lock()
+                    .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
+                let offset = file.seek(SeekFrom::End(0))?;
+                file.write_all(&bytes)?;
+                file.flush()?;
+                offset
+            };
+
+            let mut index = self
+                .shared
+                .index
+                .write()
+                .map_err(|_| DatabaseError::LockPoisoned("index"))?;
+            index.insert(key.clone(), IndexEntry { offset, size });
+        }
+
+        self.maybe_compact()?;
         Ok(())
     }
 
@@ -214,10 +219,54 @@ impl MyDatabase {
             .read()
             .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
 
-        let mut buffer = vec![0; index_info.size as usize];
         let mut file = File::open(&self.config.file_path)?;
-        file.seek(SeekFrom::Start(index_info.offset))?;
-        file.read_exact(&mut buffer)?;
+        Self::read_entry_value(&mut file, &index_info, key)
+    }
+
+    pub fn delete(&self, key: Vec<u8>) -> Result<(), DatabaseError> {
+        let entry = DataEntry {
+            entry_type: EntryType::Tombstone,
+            key: key.clone(),
+            value: Vec::new(),
+        };
+        let bytes = entry.to_bytes();
+        let size = bytes.len() as u32;
+
+        {
+            let _access_guard = self
+                .shared
+                .access
+                .write()
+                .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
+
+            let offset = {
+                let mut file = self
+                    .shared
+                    .file
+                    .lock()
+                    .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
+                let offset = file.seek(SeekFrom::End(0))?;
+                file.write_all(&bytes)?;
+                file.flush()?;
+                offset
+            };
+
+            let mut index = self
+                .shared
+                .index
+                .write()
+                .map_err(|_| DatabaseError::LockPoisoned("index"))?;
+            index.insert(key.clone(), IndexEntry { offset, size });
+        }
+
+        self.maybe_compact()?;
+        Ok(())
+    }
+
+    fn decode_buffer(buffer: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
+        if buffer.len() < 9 {
+            return Err(DatabaseError::InvalidFormat);
+        }
 
         if buffer[0] == 1 {
             return Ok(None);
@@ -233,7 +282,8 @@ impl MyDatabase {
             .map_err(|_| DatabaseError::InvalidFormat)?;
         let value_len = u32::from_be_bytes(value_len_bytes) as usize;
 
-        if 9 + key_len + value_len + 4 > buffer.len() {
+        let total_len = 9 + key_len + value_len + 4;
+        if total_len > buffer.len() {
             return Err(DatabaseError::CorruptedData);
         }
 
@@ -261,42 +311,259 @@ impl MyDatabase {
             return Err(DatabaseError::CorruptedData);
         }
 
-        Ok(Some(buffer[value_start..value_end].to_vec()))
+        let decoded = Self::lz77_decode(&buffer[value_start..value_end])?;
+        Ok(Some(decoded))
     }
 
-    pub fn delete(&self, key: Vec<u8>) -> Result<(), DatabaseError> {
-        let entry = DataEntry {
-            entry_type: EntryType::Tombstone,
-            key: key.clone(),
-            value: Vec::new(),
-        };
-        let bytes = entry.to_bytes();
-        let size = bytes.len() as u32;
+    fn read_entry_value(
+        reader: &mut File,
+        entry: &IndexEntry,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, DatabaseError> {
+        let mut buffer = vec![0; entry.size as usize];
+        reader.seek(SeekFrom::Start(entry.offset))?;
+        reader.read_exact(&mut buffer)?;
+        Self::decode_buffer(&buffer, key)
+    }
 
+    fn lz77_encode(input: &[u8]) -> Vec<u8> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut literals: Vec<u8> = Vec::new();
+        let mut i = 0;
+
+        while i < input.len() {
+            let (dist, len) = Self::find_longest_match(input, i);
+            if len >= 3 {
+                if !literals.is_empty() {
+                    Self::emit_literals(&mut out, &mut literals);
+                }
+                out.push(1);
+                out.extend_from_slice(&(dist as u16).to_be_bytes());
+                out.push(len as u8);
+                i += len;
+            } else {
+                literals.push(input[i]);
+                if literals.len() == u8::MAX as usize {
+                    Self::emit_literals(&mut out, &mut literals);
+                }
+                i += 1;
+            }
+        }
+
+        if !literals.is_empty() {
+            Self::emit_literals(&mut out, &mut literals);
+        }
+
+        out
+    }
+
+    fn emit_literals(out: &mut Vec<u8>, literals: &mut Vec<u8>) {
+        out.push(0);
+        out.push(literals.len() as u8);
+        out.extend_from_slice(literals);
+        literals.clear();
+    }
+
+    fn find_longest_match(input: &[u8], pos: usize) -> (usize, usize) {
+        let window = 4095usize;
+        let max_len = 255usize;
+        let start = pos.saturating_sub(window);
+        let mut best_len = 0usize;
+        let mut best_dist = 0usize;
+
+        for j in start..pos {
+            let mut len = 0usize;
+            while len < max_len && pos + len < input.len() && input[j + len] == input[pos + len] {
+                len += 1;
+            }
+
+            if len > best_len {
+                best_len = len;
+                best_dist = pos - j;
+                if best_len == max_len {
+                    break;
+                }
+            }
+        }
+
+        (best_dist, best_len)
+    }
+
+    fn lz77_decode(input: &[u8]) -> Result<Vec<u8>, DatabaseError> {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < input.len() {
+            let tag = input[i];
+            i += 1;
+
+            match tag {
+                0 => {
+                    if i >= input.len() {
+                        return Err(DatabaseError::InvalidFormat);
+                    }
+                    let len = input[i] as usize;
+                    i += 1;
+                    if len == 0 || i + len > input.len() {
+                        return Err(DatabaseError::InvalidFormat);
+                    }
+                    out.extend_from_slice(&input[i..i + len]);
+                    i += len;
+                }
+                1 => {
+                    if i + 2 >= input.len() {
+                        return Err(DatabaseError::InvalidFormat);
+                    }
+                    let dist = u16::from_be_bytes([input[i], input[i + 1]]) as usize;
+                    i += 2;
+                    let len = input[i] as usize;
+                    i += 1;
+                    if dist == 0 || len == 0 || dist > out.len() {
+                        return Err(DatabaseError::InvalidFormat);
+                    }
+                    for _ in 0..len {
+                        let b = out[out.len() - dist];
+                        out.push(b);
+                    }
+                }
+                _ => return Err(DatabaseError::InvalidFormat),
+            }
+        }
+
+        Ok(out)
+    }
+
+    pub fn compact(&self) -> Result<(), DatabaseError> {
         let _access_guard = self
             .shared
             .access
             .write()
             .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
 
-        let offset = {
-            let mut file = self
+        let index_snapshot = {
+            let index = self
+                .shared
+                .index
+                .read()
+                .map_err(|_| DatabaseError::LockPoisoned("index"))?;
+            let mut snapshot: Vec<(Vec<u8>, IndexEntry)> =
+                index.iter().map(|(k, entry)| (k.clone(), *entry)).collect();
+            snapshot.sort_by_key(|(_, entry)| entry.offset);
+            snapshot
+        };
+
+        let live_entries = {
+            let mut reader = File::open(&self.config.file_path)?;
+            let mut entries = Vec::new();
+            for (key, entry) in index_snapshot {
+                if let Some(value) = Self::read_entry_value(&mut reader, &entry, &key)? {
+                    entries.push((key, value));
+                }
+            }
+            entries
+        };
+
+        let temp_path = self.config.file_path.with_extension("db.compacted");
+        let _ = std::fs::remove_file(&temp_path);
+
+        let mut new_index = HashMap::new();
+        {
+            let mut temp_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            for (key, value) in &live_entries {
+                let entry = DataEntry {
+                    entry_type: EntryType::Data,
+                    key: key.clone(),
+                    value: value.clone(),
+                };
+                let bytes = entry.to_bytes();
+                let offset = temp_file.seek(SeekFrom::End(0))?;
+                temp_file.write_all(&bytes)?;
+                new_index.insert(
+                    key.clone(),
+                    IndexEntry {
+                        offset,
+                        size: bytes.len() as u32,
+                    },
+                );
+            }
+            temp_file.flush()?;
+        }
+
+        {
+            let _guard = self
                 .shared
                 .file
                 .lock()
                 .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
-            let offset = file.seek(SeekFrom::End(0))?;
-            file.write_all(&bytes)?;
-            file.flush()?;
-            offset
-        };
+            drop(_guard);
+        }
 
-        let mut index = self
+        match std::fs::rename(&temp_path, &self.config.file_path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&self.config.file_path)?;
+                std::fs::rename(&temp_path, &self.config.file_path)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        let new_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&self.config.file_path)?;
+        {
+            let mut guard = self
+                .shared
+                .file
+                .lock()
+                .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
+            *guard = new_file;
+        }
+
+        let mut index_guard = self
             .shared
             .index
             .write()
             .map_err(|_| DatabaseError::LockPoisoned("index"))?;
-        index.insert(key, IndexEntry { offset, size });
+        *index_guard = new_index;
+
+        Ok(())
+    }
+
+    fn file_size(&self) -> Result<u64, DatabaseError> {
+        Ok(std::fs::metadata(&self.config.file_path)?.len())
+    }
+
+    fn maybe_compact(&self) -> Result<(), DatabaseError> {
+        if self.config.max_size == 0 {
+            return Ok(());
+        }
+
+        loop {
+            let len = self.file_size()?;
+            if len < self.config.max_size {
+                break;
+            }
+            let before = len;
+            self.compact()?;
+            let after = self.file_size()?;
+            if after >= before {
+                break;
+            }
+        }
+
         Ok(())
     }
 }
