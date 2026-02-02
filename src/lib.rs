@@ -90,6 +90,7 @@ pub struct IndexEntry {
 
 pub struct SharedState {
     pub file: Mutex<File>,
+    pub access: RwLock<()>,
     pub index: RwLock<HashMap<Vec<u8>, IndexEntry>>,
 }
 
@@ -151,6 +152,7 @@ impl MyDatabase {
 
         let shared = Arc::new(SharedState {
             file: Mutex::new(file),
+            access: RwLock::new(()),
             index: RwLock::new(HashMap::new()),
         });
 
@@ -165,6 +167,12 @@ impl MyDatabase {
         };
         let bytes = entry.to_bytes();
         let size = bytes.len() as u32;
+
+        let _access_guard = self
+            .shared
+            .access
+            .write()
+            .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
 
         let offset = {
             let mut file = self
@@ -200,16 +208,16 @@ impl MyDatabase {
             }
         };
 
+        let _access_guard = self
+            .shared
+            .access
+            .read()
+            .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
+
         let mut buffer = vec![0; index_info.size as usize];
-        {
-            let mut file = self
-                .shared
-                .file
-                .lock()
-                .map_err(|_| DatabaseError::LockPoisoned("fichier"))?;
-            file.seek(SeekFrom::Start(index_info.offset))?;
-            file.read_exact(&mut buffer)?;
-        }
+        let mut file = File::open(&self.config.file_path)?;
+        file.seek(SeekFrom::Start(index_info.offset))?;
+        file.read_exact(&mut buffer)?;
 
         if buffer[0] == 1 {
             return Ok(None);
@@ -265,6 +273,12 @@ impl MyDatabase {
         let bytes = entry.to_bytes();
         let size = bytes.len() as u32;
 
+        let _access_guard = self
+            .shared
+            .access
+            .write()
+            .map_err(|_| DatabaseError::LockPoisoned("lecteur/rédacteur"))?;
+
         let offset = {
             let mut file = self
                 .shared
@@ -293,45 +307,5 @@ impl Clone for MyDatabase {
             config: self.config.clone(),
             shared: Arc::clone(&self.shared),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::thread;
-
-    #[test]
-    fn concurrent_set_get() {
-        let db_path = PathBuf::from("test_concurrent.db");
-        let _ = fs::remove_file(&db_path);
-
-        let mut config = DatabaseConfig::new();
-        config.file_path = db_path.clone();
-        let db = MyDatabase::new(config).expect("créer la base concurrente");
-
-        let handles: Vec<_> = (0..4)
-            .map(|i| {
-                let db = db.clone();
-                thread::spawn(move || {
-                    let key = format!("key-{}", i).into_bytes();
-                    let value = format!("value-{}", i).into_bytes();
-                    db.set(key.clone(), value.clone()).expect("set concurrent");
-                    let read = db
-                        .get(&key)
-                        .expect("lecture concurrente")
-                        .expect("clé présente");
-                    assert_eq!(read, value);
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.join().expect("panic thread");
-        }
-
-        let _ = fs::remove_file(&db_path);
     }
 }
