@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+/// Point d'entrée CLI (REPL).
 fn main() -> Result<(), DatabaseError> {
     let config = DatabaseConfig::new();
     let db = MyDatabase::new(config)?;
@@ -15,6 +16,7 @@ fn main() -> Result<(), DatabaseError> {
     println!("  GET <clé> --file <chemin>  - Écrit la valeur dans un fichier");
     println!("  DELETE <clé>        - Supprime une clé (Tombstone)");
     println!("  COMPACT             - Compacter le fichier de log");
+    println!("  LOG [--limit N]     - Affiche les entrées du journal");
     println!("  EXIT                - Quitte le programme\n");
 
     loop {
@@ -63,15 +65,13 @@ fn main() -> Result<(), DatabaseError> {
 
                 let is_file = parts[2] == "--file";
                 match db.set(key.clone(), value.clone()) {
-                    Ok(_) if is_file => println!(
-                        "SET '{}' = <{} octets>",
-                        String::from_utf8(key)?,
-                        value.len()
-                    ),
+                    Ok(_) if is_file => {
+                        println!("SET '{}' = <{} octets>", display_bytes(&key), value.len())
+                    }
                     Ok(_) => println!(
                         "SET '{}' = '{}'",
-                        String::from_utf8(key)?,
-                        String::from_utf8(value)?
+                        display_bytes(&key),
+                        display_bytes(&value)
                     ),
                     Err(e) => println!("Erreur SET: {}", e),
                 }
@@ -93,7 +93,7 @@ fn main() -> Result<(), DatabaseError> {
                             match fs::write(&path, &value) {
                                 Ok(_) => println!(
                                     "GET '{}' -> fichier écrit: {}",
-                                    String::from_utf8(key.clone())?,
+                                    display_bytes(&key),
                                     path.display()
                                 ),
                                 Err(e) => println!("Erreur écriture fichier: {}", e),
@@ -101,12 +101,12 @@ fn main() -> Result<(), DatabaseError> {
                         } else {
                             println!(
                                 "GET '{}' = '{}'",
-                                String::from_utf8(key.clone())?,
-                                String::from_utf8(value)?
+                                display_bytes(&key),
+                                display_bytes(&value)
                             );
                         }
                     }
-                    Ok(None) => println!("Clé '{}' non trouvée", String::from_utf8(key)?),
+                    Ok(None) => println!("Clé '{}' non trouvée", display_bytes(&key)),
                     Err(e) => println!("Erreur GET: {}", e),
                 }
             }
@@ -120,7 +120,7 @@ fn main() -> Result<(), DatabaseError> {
                 let key = parts[1].as_bytes().to_vec();
 
                 match db.delete(key.clone()) {
-                    Ok(_) => println!("DELETE '{}' (Tombstone écrit)", String::from_utf8(key)?),
+                    Ok(_) => println!("DELETE '{}' (Tombstone écrit)", display_bytes(&key)),
                     Err(e) => println!("Erreur DELETE: {}", e),
                 }
             }
@@ -135,6 +135,39 @@ fn main() -> Result<(), DatabaseError> {
                 Err(e) => println!("Erreur COMPACT: {}", e),
             },
 
+            "LOG" => {
+                let limit = if parts.len() >= 3 && parts[1] == "--limit" {
+                    parts[2].parse::<usize>().ok()
+                } else {
+                    None
+                };
+
+                match db.log_iter() {
+                    Ok(iter) => {
+                        for (idx, record) in iter.flatten().enumerate() {
+                            if let Some(max) = limit
+                                && idx >= max
+                            {
+                                break;
+                            }
+                            let entry_type = match record.entry_type {
+                                rust_database::EntryType::Data => "DATA",
+                                rust_database::EntryType::Tombstone => "TOMBSTONE",
+                            };
+                            println!(
+                                "#{idx} offset={} size={} type={} key={} checksum_ok={}",
+                                record.offset,
+                                record.size,
+                                entry_type,
+                                display_bytes(&record.key),
+                                record.checksum_ok
+                            );
+                        }
+                    }
+                    Err(e) => println!("Erreur LOG: {}", e),
+                }
+            }
+
             _ => {
                 println!("Commande inconnue. Commandes disponibles :");
                 println!("  SET <clé> <valeur> : Enregistrer une donnée");
@@ -143,10 +176,25 @@ fn main() -> Result<(), DatabaseError> {
                 println!("  GET <clé> --file <chemin> : Écrire une donnée en fichier");
                 println!("  DELETE <clé>       : Supprimer une donnée");
                 println!("  COMPACT            : Réduire le fichier de log");
+                println!("  LOG [--limit N]    : Voir le le fichier de log");
                 println!("  EXIT               : Quitter le programme");
             }
         }
     }
 
     Ok(())
+}
+
+/// Affiche une valeur UTF-8 ou un hex en fallback.
+fn display_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                out.push_str(&format!("{:02x}", b));
+            }
+            format!("0x{}", out)
+        }
+    }
 }
